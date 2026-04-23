@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generiert via Claude
+Generiert mit Claude
 OPSI Hardware Inventory Export
 Exportiert CPU, RAM, Festplatte, MAC-Adressen, OS und letzte Aktivität
 als CSV-Datei über die OPSI JSON-RPC API.
@@ -35,6 +35,7 @@ CSV_COLUMNS = [
     "MAC_LAN",
     "MAC_WLAN",
     "Betriebssystem",
+    "Netboot_Produkt",
     "Letzte_Aktivitaet",
 ]
 
@@ -320,15 +321,39 @@ def get_os_from_products(base_url, user, password, verify_ssl):
 
 
 def format_last_seen(raw: str) -> str:
-    """Formatiert den OPSI-Timestamp in lesbares Datum/Uhrzeit."""
+    """Formatiert den OPSI-Timestamp als ISO-Datum YYYY-MM-DD."""
     if not raw:
         return ""
     try:
-        # OPSI liefert typischerweise 'YYYY-MM-DD HH:MM:SS'
         dt = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
-        return dt.strftime("%d.%m.%Y %H:%M")
+        return dt.strftime("%Y-%m-%d")
     except ValueError:
-        return raw
+        return raw[:10] if len(raw) >= 10 else raw
+
+
+def get_netboot_products(base_url, user, password, verify_ssl):
+    """
+    Liest installierte Netboot-Produkte die mit 'opsi-local-image' beginnen.
+    Gibt ein dict {client_id: produkt_id} zurück.
+    """
+    try:
+        result = rpc_call(base_url, user, password,
+                          "productOnClient_getObjects",
+                          [["clientId", "productId"],
+                           {"installationStatus": "installed",
+                            "productType": "NetbootProduct"}],
+                          verify_ssl)
+    except SystemExit:
+        return {}
+
+    netboot_map = {}
+    for obj in result:
+        cid = obj.get("clientId", "")
+        pid = obj.get("productId", "")
+        if cid and pid.startswith("opsi-local-image"):
+            if cid not in netboot_map:
+                netboot_map[cid] = pid
+    return netboot_map
 
 # ---------------------------------------------------------------------------
 # Hauptprogramm
@@ -382,6 +407,10 @@ def main():
     print("[INFO] Lade Betriebssystem-Informationen ...")
     os_map = get_installed_os(args.host, args.user, args.password, verify_ssl)
 
+    # Netboot-Produkte abrufen
+    print("[INFO] Lade Netboot-Produkte ...")
+    netboot_map = get_netboot_products(args.host, args.user, args.password, verify_ssl)
+
     # CSV schreiben
     print(f"[INFO] Schreibe CSV nach '{args.output}' ...")
     with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
@@ -396,6 +425,7 @@ def main():
             disk_gb, disk_type = parse_disk(hw_objects)
             mac_lan, mac_wlan = parse_mac_addresses(hw_objects)
             os_name = os_map.get(client_id, "")
+            netboot = netboot_map.get(client_id, "")
             last_activity = format_last_seen(last_seen.get(client_id, ""))
 
             writer.writerow({
@@ -407,6 +437,7 @@ def main():
                 "MAC_LAN":          mac_lan,
                 "MAC_WLAN":         mac_wlan,
                 "Betriebssystem":   os_name,
+                "Netboot_Produkt":  netboot,
                 "Letzte_Aktivitaet": last_activity,
             })
 
