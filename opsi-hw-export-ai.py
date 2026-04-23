@@ -28,6 +28,9 @@ DEFAULT_OUTPUT = "opsi_export.csv"
 
 CSV_COLUMNS = [
     "Client",
+    "Hersteller",
+    "Modell",
+    "Seriennummer",
     "CPU",
     "RAM_GB",
     "Festplatte_GB",
@@ -153,6 +156,16 @@ def get_installed_os(base_url, user, password, verify_ssl):
 # ---------------------------------------------------------------------------
 # Hardware-Parser
 # ---------------------------------------------------------------------------
+
+def parse_device_info(hw_objects: list) -> tuple:
+    """Gibt (hersteller, modell, seriennummer) aus COMPUTER_SYSTEM zurück."""
+    for obj in hw_objects:
+        if obj.get("hardwareClass", "").upper() == "COMPUTER_SYSTEM":
+            vendor  = obj.get("vendor", "")  or ""
+            model   = obj.get("model",  "")  or ""
+            serial  = obj.get("serialNumber", "") or ""
+            return vendor.strip(), model.strip(), serial.strip()
+    return "", "", ""
 
 def bytes_to_gb(value) -> str:
     """Konvertiert Bytes (int oder str) in GB, gerundet auf 1 Dezimalstelle."""
@@ -420,6 +433,7 @@ def main():
         for client_id in sorted(clients):
             hw_objects = hw_data.get(client_id, [])
 
+            vendor, model, serial = parse_device_info(hw_objects)
             cpu = parse_cpu(hw_objects)
             ram = parse_ram(hw_objects)
             disk_gb, disk_type = parse_disk(hw_objects)
@@ -430,6 +444,9 @@ def main():
 
             writer.writerow({
                 "Client":           client_id,
+                "Hersteller":       vendor,
+                "Modell":           model,
+                "Seriennummer":     serial,
                 "CPU":              cpu,
                 "RAM_GB":           ram,
                 "Festplatte_GB":    disk_gb,
