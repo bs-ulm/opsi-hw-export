@@ -1,7 +1,6 @@
-# KI Generiert, Claude
-
 #!/usr/bin/env python3
 """
+Generiert via Claude
 OPSI Hardware Inventory Export
 Exportiert CPU, RAM, Festplatte, MAC-Adressen, OS und letzte Aktivität
 als CSV-Datei über die OPSI JSON-RPC API.
@@ -173,94 +172,88 @@ def mb_to_gb(value) -> str:
 
 
 def parse_cpu(hw_objects: list) -> str:
-    for obj in hw_objects:
-        if obj.get("hardwareClass", "").upper() == "COMPUTER_SYSTEM":
-            name = obj.get("name", "")
-            if name:
-                return name
+    # PROCESSOR zuerst – enthält den echten CPU-Namen
     for obj in hw_objects:
         if obj.get("hardwareClass", "").upper() in ("PROCESSOR", "CPU"):
             name = obj.get("name", "") or obj.get("description", "")
             if name:
                 return name
+    # COMPUTER_SYSTEM nur als Fallback (name = Hostname, daher unerwünscht)
+    for obj in hw_objects:
+        if obj.get("hardwareClass", "").upper() == "COMPUTER_SYSTEM":
+            model = obj.get("model", "")
+            if model:
+                return model
     return ""
 
 
 def parse_ram(hw_objects: list) -> str:
-    """Summiert alle RAM-Module und gibt den Wert in GB zurück."""
-    total_mb = 0
+    """Summiert alle RAM-Module (capacity = Bytes) und gibt den Wert in GB zurück."""
+    total_bytes = 0
     found = False
+
     for obj in hw_objects:
         cls = obj.get("hardwareClass", "").upper()
         if cls == "MEMORY_MODULE":
-            cap = obj.get("capacity", 0) or obj.get("size", 0)
+            cap = obj.get("capacity") or obj.get("size")
             try:
-                # Capacity kann in Bytes oder MB angegeben sein
-                val = int(cap)
-                # Heuristik: < 100_000 → wahrscheinlich MB, sonst Bytes
-                if val < 100_000:
-                    total_mb += val
-                else:
-                    total_mb += val // (1024 * 1024)
+                total_bytes += int(cap)   # OPSI liefert stets Bytes
                 found = True
             except (TypeError, ValueError):
                 pass
-        elif cls == "COMPUTER_SYSTEM" and not found:
-            # Fallback: totalPhysicalMemory in Bytes
-            mem = obj.get("totalPhysicalMemory", 0)
-            if mem:
+
+    if not found:
+        # Fallback: totalPhysicalMemory aus COMPUTER_SYSTEM (ebenfalls Bytes)
+        for obj in hw_objects:
+            if obj.get("hardwareClass", "").upper() == "COMPUTER_SYSTEM":
+                mem = obj.get("totalPhysicalMemory")
                 try:
-                    total_mb = int(mem) // (1024 * 1024)
+                    total_bytes = int(mem)
                     found = True
+                    break
                 except (TypeError, ValueError):
                     pass
 
-    if total_mb:
-        gb = total_mb / 1024
+    if total_bytes:
+        gb = total_bytes / (1024 ** 3)
         return f"{gb:.1f}"
     return ""
 
 
 def parse_disk(hw_objects: list) -> tuple:
     """
-    Gibt (kapazitaet_gb, typ) der ersten relevanten Festplatte zurück.
-    Typ: SSD, NVMe oder HDD.
+    Gibt (kapazitaet_gb, typ) der ersten Festplatte mit gültigem size-Wert zurück.
+    Typ: NVMe, SSD oder HDD — ermittelt aus description/model/name.
     """
-    candidates = []
     for obj in hw_objects:
         cls = obj.get("hardwareClass", "").upper()
-        if cls not in ("DISK_DRIVE", "HARDDISK", "PHYSICALDISK"):
+        if cls not in ("HARDDISK_DRIVE", "DISK_DRIVE", "HARDDISK", "PHYSICALDISK"):
             continue
 
-        size_raw = (obj.get("size") or obj.get("diskSize") or
-                    obj.get("capacity") or 0)
+        size_raw = obj.get("size") or obj.get("diskSize") or obj.get("capacity")
         try:
             size_bytes = int(size_raw)
+            if size_bytes <= 0:
+                continue
         except (TypeError, ValueError):
-            size_bytes = 0
+            continue  # size null/leer → überspringen
 
-        # Typ ermitteln
-        model = (obj.get("model") or obj.get("name") or
-                 obj.get("description") or "").upper()
-        media_type = (obj.get("mediaType") or obj.get("type") or "").upper()
+        # Typ ermitteln: description, model und name auswerten
+        desc  = (obj.get("description") or "").upper()
+        model = (obj.get("model")       or "").upper()
+        name  = (obj.get("name")        or "").upper()
+        combined = f"{desc} {model} {name}"
 
-        if "NVME" in model or "NVME" in media_type:
+        if "NVME" in combined:
             disk_type = "NVMe"
-        elif ("SSD" in model or "SOLID" in model or
-              "SSD" in media_type or media_type == "SSD"):
+        elif "SSD" in combined or "SOLID" in combined:
             disk_type = "SSD"
         else:
             disk_type = "HDD"
 
-        candidates.append((size_bytes, disk_type))
+        gb = size_bytes / (1024 ** 3)
+        return f"{gb:.0f}", disk_type
 
-    # Erstes Laufwerk (Reihenfolge wie von OPSI geliefert)
-    if candidates:
-        size_bytes, disk_type = candidates[0]
-        if size_bytes:
-            gb = size_bytes / (1024 ** 3)
-            return f"{gb:.0f}", disk_type
-        return "", disk_type
     return "", ""
 
 
