@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
+# Python-3-Pflicht: sofortiger Abbruch bei Python 2
+import sys
+if sys.version_info[0] < 3:
+    sys.exit("[FEHLER] Dieses Skript erfordert Python 3. Bitte mit 'python3' aufrufen.")
+
 """
-Generiert mit Claude
-OPSI Hardware Inventory Export
+opsi-hw-export-ai.py – OPSI Hardware Inventory Export
 Exportiert CPU, RAM, Festplatte, MAC-Adressen, OS und letzte Aktivität
 als CSV-Datei über die OPSI JSON-RPC API.
 
 Verwendung:
-    python opsi_export.py --host https://opsi-server:4447 --user admin --password SECRET
-    python opsi_export.py --host https://opsi-server:4447 --user admin --password SECRET --output export.csv
+    python3 opsi-hw-export-ai.py --schulkuerzel aeg --host https://opsi-server:4447 --user admin --password SECRET
+    python3 opsi-hw-export-ai.py --schulkuerzel szg --host https://opsi-server:4447 --user admin --password SECRET --scp-host backup.example.com --scp-user backup
 """
 
 import argparse
@@ -18,7 +22,10 @@ import urllib.request
 import urllib.error
 import ssl
 import base64
-from datetime import datetime
+from datetime import datetime, date
+import getpass
+import re
+import subprocess
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -27,6 +34,7 @@ from datetime import datetime
 DEFAULT_OUTPUT = "opsi_export.csv"
 
 CSV_COLUMNS = [
+    "Schulkuerzel",
     "Client",
     "Hersteller",
     "Modell",
@@ -36,7 +44,6 @@ CSV_COLUMNS = [
     "Festplatte_GB",
     "Festplatten_Typ",
     "MAC_LAN",
-    "MAC_WLAN",
     "Betriebssystem",
     "Netboot_Produkt",
     "Letzte_Aktivitaet",
@@ -271,14 +278,8 @@ def parse_disk(hw_objects: list) -> tuple:
     return "", ""
 
 
-def parse_mac_addresses(hw_objects: list) -> tuple:
-    """
-    Gibt (mac_lan, mac_wlan) zurück.
-    Unterscheidet per Beschreibung / Name ob LAN oder WLAN.
-    """
-    mac_lan = ""
-    mac_wlan = ""
-
+def parse_mac_lan(hw_objects: list) -> str:
+    """Gibt die MAC-Adresse des ersten kabelgebundenen Netzwerkadapters zurück."""
     for obj in hw_objects:
         cls = obj.get("hardwareClass", "").upper()
         if cls not in ("NETWORK_CONTROLLER", "NETWORK_ADAPTER",
@@ -293,15 +294,13 @@ def parse_mac_addresses(hw_objects: list) -> tuple:
         desc = (obj.get("description") or obj.get("name") or
                 obj.get("productName") or "").upper()
 
+        # WLAN-Adapter überspringen
         if any(kw in desc for kw in ("WIRELESS", "WIFI", "WI-FI", "WLAN",
-                                     "802.11", "WLAN", "AX", "AC")):
-            if not mac_wlan:
-                mac_wlan = mac
-        else:
-            if not mac_lan:
-                mac_lan = mac
+                                     "802.11", "AX", "AC")):
+            continue
 
-    return mac_lan, mac_wlan
+        return mac
+    return ""
 
 # ---------------------------------------------------------------------------
 # OS aus Produkten ermitteln (Fallback)
@@ -369,27 +368,91 @@ def get_netboot_products(base_url, user, password, verify_ssl):
     return netboot_map
 
 # ---------------------------------------------------------------------------
+# SCP-Upload
+# ---------------------------------------------------------------------------
+
+def upload_via_scp(local_file: str, scp_user: str, scp_host: str,
+                   remote_filename: str) -> None:
+    """Lädt die CSV-Datei per SCP auf den Zielserver hoch.
+    Das SSH-Passwort wird via sshpass übergeben, falls verfügbar,
+    andernfalls direkt über SCP (Schlüssel-Auth oder interaktiv).
+    """
+    remote_path = f"~/{remote_filename}"
+    scp_dest = f"{scp_user}@{scp_host}:{remote_path}"
+
+    # Passwort zur Laufzeit abfragen
+    scp_password = getpass.getpass(
+        f"[SCP] Passwort für {scp_user}@{scp_host}: "
+    )
+
+    # sshpass vorhanden? → nutzen, sonst SCP ohne (Key-Auth / interaktiv)
+    sshpass_available = subprocess.run(
+        ["which", "sshpass"], capture_output=True
+    ).returncode == 0
+
+    if sshpass_available:
+        cmd = [
+            "sshpass", "-p", scp_password,
+            "scp", "-o", "StrictHostKeyChecking=no",
+            local_file, scp_dest,
+        ]
+    else:
+        print("[INFO] sshpass nicht gefunden – versuche SCP ohne Passwort-Argument.")
+        cmd = ["scp", "-o", "StrictHostKeyChecking=no", local_file, scp_dest]
+
+    print(f"[INFO] Lade '{local_file}' hoch nach {scp_dest} ...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print(f"[OK] Upload erfolgreich: {scp_dest}")
+    else:
+        print(f"[FEHLER] SCP-Upload fehlgeschlagen:\n{result.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Hauptprogramm
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="OPSI Hardware Inventory → CSV Export",
+        description="opsi-hw-export-ai.py – OPSI Hardware Inventory → CSV Export",
         formatter_class=argparse.RawTextHelpFormatter,
     )
+    parser.add_argument("--schulkuerzel", required=True,
+                        help="Schulkürzel, 3–4 Buchstaben, z.B. aeg oder szg")
     parser.add_argument("--host", required=True,
                         help="OPSI Server URL, z.B. https://opsi-server:4447")
     parser.add_argument("--user", required=True,
                         help="OPSI Benutzername")
-    parser.add_argument("--password", required=True,
-                        help="OPSI Passwort")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT,
-                        help=f"Ausgabedatei (Standard: {DEFAULT_OUTPUT})")
+    parser.add_argument("--password", default=None,
+                        help="OPSI Passwort (wird interaktiv abgefragt wenn weggelassen)")
+    parser.add_argument("--output", default=None,
+                        help="Lokale Ausgabedatei (Standard: <schulkuerzel>-<datum>-export-opsi.csv)")
     parser.add_argument("--no-verify-ssl", action="store_true",
                         help="SSL-Zertifikat nicht prüfen (selbstsignierte Zerts)")
     parser.add_argument("--clients", nargs="*",
                         help="Nur bestimmte Clients exportieren (optional)")
+    parser.add_argument("--scp-host", default=None,
+                        help="SCP-Zielserver, z.B. backup.example.com")
+    parser.add_argument("--scp-user", default=None,
+                        help="SCP-Benutzername auf dem Zielserver")
     args = parser.parse_args()
+
+    # Schulkürzel validieren und normalisieren
+    schulkuerzel = args.schulkuerzel.lower()
+    if not re.fullmatch(r'[a-z]{3,4}', schulkuerzel):
+        parser.error("--schulkuerzel muss aus 3–4 Buchstaben bestehen (nur a–z).")
+
+    # Dateinamen ableiten
+    today = date.today().strftime("%Y-%m-%d")
+    remote_filename = f"{schulkuerzel}-{today}-export-opsi.csv"
+    output_file = args.output if args.output else remote_filename
+
+    # OPSI-Passwort ggf. interaktiv abfragen
+    opsi_password = args.password or getpass.getpass(
+        f"[OPSI] Passwort für {args.user}@{args.host}: "
+    )
 
     verify_ssl = not args.no_verify_ssl
 
@@ -400,7 +463,7 @@ def main():
         clients = args.clients
         print(f"[INFO] {len(clients)} Clients manuell angegeben.")
     else:
-        clients = get_all_clients(args.host, args.user, args.password, verify_ssl)
+        clients = get_all_clients(args.host, args.user, opsi_password, verify_ssl)
         print(f"[INFO] {len(clients)} Clients gefunden.")
 
     if not clients:
@@ -409,24 +472,24 @@ def main():
 
     # Hardware-Daten abrufen
     print("[INFO] Lade Hardware-Inventar ...")
-    hw_data = get_hardware_info(args.host, args.user, args.password,
+    hw_data = get_hardware_info(args.host, args.user, opsi_password,
                                 clients, verify_ssl)
 
     # Letzte Aktivität
     print("[INFO] Lade Aktivitätsdaten ...")
-    last_seen = get_last_seen(args.host, args.user, args.password, verify_ssl)
+    last_seen = get_last_seen(args.host, args.user, opsi_password, verify_ssl)
 
     # OS ermitteln
     print("[INFO] Lade Betriebssystem-Informationen ...")
-    os_map = get_installed_os(args.host, args.user, args.password, verify_ssl)
+    os_map = get_installed_os(args.host, args.user, opsi_password, verify_ssl)
 
     # Netboot-Produkte abrufen
     print("[INFO] Lade Netboot-Produkte ...")
-    netboot_map = get_netboot_products(args.host, args.user, args.password, verify_ssl)
+    netboot_map = get_netboot_products(args.host, args.user, opsi_password, verify_ssl)
 
     # CSV schreiben
-    print(f"[INFO] Schreibe CSV nach '{args.output}' ...")
-    with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
+    print(f"[INFO] Schreibe CSV nach '{output_file}' ...")
+    with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, delimiter=";")
         writer.writeheader()
 
@@ -437,12 +500,13 @@ def main():
             cpu = parse_cpu(hw_objects)
             ram = parse_ram(hw_objects)
             disk_gb, disk_type = parse_disk(hw_objects)
-            mac_lan, mac_wlan = parse_mac_addresses(hw_objects)
+            mac_lan = parse_mac_lan(hw_objects)
             os_name = os_map.get(client_id, "")
             netboot = netboot_map.get(client_id, "")
             last_activity = format_last_seen(last_seen.get(client_id, ""))
 
             writer.writerow({
+                "Schulkuerzel":     schulkuerzel,
                 "Client":           client_id,
                 "Hersteller":       vendor,
                 "Modell":           model,
@@ -452,13 +516,18 @@ def main():
                 "Festplatte_GB":    disk_gb,
                 "Festplatten_Typ":  disk_type,
                 "MAC_LAN":          mac_lan,
-                "MAC_WLAN":         mac_wlan,
                 "Betriebssystem":   os_name,
                 "Netboot_Produkt":  netboot,
                 "Letzte_Aktivitaet": last_activity,
             })
 
-    print(f"[OK] Export abgeschlossen: {len(clients)} Clients in '{args.output}'")
+    print(f"[OK] Export abgeschlossen: {len(clients)} Clients in '{output_file}'")
+
+    # SCP-Upload, wenn --scp-host und --scp-user angegeben
+    if args.scp_host and args.scp_user:
+        upload_via_scp(output_file, args.scp_user, args.scp_host, remote_filename)
+    elif args.scp_host or args.scp_user:
+        print("[WARNUNG] Für SCP-Upload werden sowohl --scp-host als auch --scp-user benötigt.")
 
 
 if __name__ == "__main__":
